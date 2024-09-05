@@ -31,10 +31,24 @@ def get_votes(task, x, ys, n_evaluate_sample):
     values = task.vote_outputs_unwrap(vote_outputs, len(ys))
     return values
 
-def get_proposals(task, x, y): 
+def get_proposals(task, x, y):
     propose_prompt = task.propose_prompt_wrap(x, y)
     proposals = gpt(propose_prompt, n=1, stop=None)[0].split('\n')
-    return [y + _ + '\n' for _ in proposals]
+    
+    valid_proposals = [
+        proposal for proposal in proposals 
+        if not any(phrase in proposal.lower() for phrase in [
+            "no operations can be performed",
+            "no possible next steps",
+            "single number",
+        ])
+    ]
+    
+    if not valid_proposals:
+        return []
+    
+    # Otherwise, return the valid proposals
+    return [y + _ + '\n' for _ in valid_proposals]
 
 def get_samples(task, x, y, n_generate_sample, prompt_sample, stop):
     if prompt_sample == 'standard':
@@ -46,10 +60,9 @@ def get_samples(task, x, y, n_generate_sample, prompt_sample, stop):
     samples = gpt(prompt, n=n_generate_sample, stop=stop)
     return [y + _ for _ in samples]
 
-def solve(args, task, idx, to_print=True):
+def solve_bfs(args, task, idx, to_print=True):
     global gpt
     gpt = partial(gpt, model=args.backend, temperature=args.temperature)
-    print(gpt)
     x = task.get_input(idx)  # input
     ys = ['']  # current output candidates
     infos = []
@@ -87,10 +100,73 @@ def solve(args, task, idx, to_print=True):
         print(ys)
     return ys, {'steps': infos}
 
+
+
+def dfs_helper(args, task, idx, y, t, paths, infos):
+    global gpt
+    gpt = partial(gpt, model=args.backend, temperature=args.temperature)
+    x = task.get_input(idx)
+    T = args.T 
+    
+    step_info = {'step': t, 'x': x, 'y': y}
+    
+    if t >= T:
+        # Evaluate final reasoning
+        if args.method_evaluate == 'vote':
+            values = get_votes(task, x, [y], args.n_evaluate_sample)
+        elif args.method_evaluate == 'value':
+            values = get_values(task, x, [y], args.n_evaluate_sample)
+        
+        current_value = values[0] if values else 0
+        
+        step_info['values'] = values
+        step_info['selected'] = []
+        
+        if current_value >= args.thresh:
+            paths.append((y, current_value))
+            step_info['selected'] = [y]
+        
+        infos.append(step_info)
+        return
+    
+    # Generation
+    if args.method_generate == 'sample':
+        new_ys = get_samples(task, x, y, args.n_generate_sample, prompt_sample=args.prompt_sample)
+    elif args.method_generate == 'propose':
+        new_ys = get_proposals(task, x, y)
+    print(new_ys)
+    
+    step_info['new_ys'] = new_ys
+    
+    # Evaluation
+    if args.method_evaluate == 'vote':
+        values = get_votes(task, x, new_ys, args.n_evaluate_sample)
+    elif args.method_evaluate == 'value':
+        values = get_values(task, x, new_ys, args.n_evaluate_sample)
+    print(values)
+    
+    step_info['values'] = values
+
+    candidates = sorted(zip(new_ys, values), key=lambda x: x[1], reverse=True)
+    candidates = [(new_y, value) for new_y, value in candidates if value >= args.thresh]
+
+    selected = [new_y for new_y, _ in candidates[:args.n_select_sample]]
+    step_info['selected'] = selected
+    
+    infos.append(step_info)
+
+    for new_y, value in candidates[:args.n_select_sample]:
+        dfs_helper(args, task, idx, new_y, t+1, paths, infos)
+
+def solve_dfs(args, task, idx):
+    paths = []
+    infos = []
+    dfs_helper(args, task, idx, '', 0, paths, infos)
+    return paths, {'steps': infos}
+
 def naive_solve(args, task, idx, to_print=True):
     global gpt
     gpt = partial(gpt, model=args.backend, temperature=args.temperature)
-    print(gpt)
     x = task.get_input(idx)  # input
     ys = get_samples(task, x, '', args.n_generate_sample, args.prompt_sample, stop=None)
     return ys, {}
